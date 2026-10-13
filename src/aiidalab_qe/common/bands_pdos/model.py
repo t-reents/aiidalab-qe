@@ -167,7 +167,17 @@ class BandsPdosModel(Model):
             plot_settings=self.plot_settings,
         )
         self.plot = self.helper.bandspdosfigure
+        self.plot.layout.on_change(
+            self._on_plot_range_change, "xaxis.range", "yaxis.range"
+        )
         self._get_traces_selector_options()
+
+    def _on_plot_range_change(self, *_):
+        """Keep the thickness of the projected bands correct when zooming."""
+        if self.project_bands_box:
+            self.helper.update_projected_bands_on_relayout(
+                self.plot, self.proj_bands_width
+            )
 
     def update_bands_projections(self):
         """Update the bands projections."""
@@ -176,7 +186,7 @@ class BandsPdosModel(Model):
                 self._remove_bands_traces()
             self.bands_projections_data = self._get_bands_projections_data()
             self.helper.project_bands = self.bands_projections_data
-            self.helper.adding_projected_bands(self.plot)
+            self.helper.adding_projected_bands(self.plot, self.proj_bands_width)
         else:
             self._remove_bands_traces()
         self._get_traces_selector_options()
@@ -184,9 +194,10 @@ class BandsPdosModel(Model):
     def update_bands_projections_thickness(self):
         """Update the bands projections thickness."""
         if self.project_bands_box:
-            self.bands_projections_data = self._get_bands_projections_data()
-            self.helper.project_bands = self.bands_projections_data
-            self.helper.update_projected_bands_thickness(self.plot)
+            # The curated projections do not depend on the width, reuse them
+            self.helper.update_projected_bands_thickness(
+                self.plot, self.proj_bands_width
+            )
 
     def _remove_bands_traces(self):
         """Remove the bands traces."""
@@ -261,11 +272,9 @@ class BandsPdosModel(Model):
         if syntax_ok:
             bands_projections = get_bands_projections_data(
                 self.bands,
-                bands_data=self.bands_data,
                 group_tag=self.dos_atoms_group,
                 plot_tag=self.dos_plot_group,
                 selected_atoms=expanded_selection,
-                bands_width=self.proj_bands_width,
             )
             return bands_projections
         return None
@@ -311,6 +320,8 @@ class BandsPdosModel(Model):
         """Update the horizontal width based on the percentge."""
         horizontal_width = int((width_percentage / 100) * self.horizontal_width)
         self.plot.layout.width = horizontal_width
+        # The thickness of the projected bands depends on the size of the plot
+        self.update_bands_projections_thickness()
 
     def update_column_width_ratio(self, bands_width_percentage):
         """Update the combined_column_widths of the combined plot based on percentage."""
@@ -319,6 +330,8 @@ class BandsPdosModel(Model):
             xaxis={"domain": [0, bands_width - 0.004]},
             xaxis2={"domain": [bands_width + 0.004, 1]},
         )
+        # The thickness of the projected bands depends on the size of the plot
+        self.update_bands_projections_thickness()
 
     def download_image(self, _=None):
         """

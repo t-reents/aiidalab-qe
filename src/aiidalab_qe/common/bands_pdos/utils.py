@@ -8,6 +8,7 @@ from pymatgen.core.periodic_table import Element
 
 from aiida.common.extendeddicts import AttributeDict
 from aiida.orm import ProjectionData, WorkChainNode
+from aiidalab_qe.common.bands_pdos.fat_bands import fat_band_polygons
 
 # Constants for HTML tags
 HTML_TAGS = {
@@ -115,12 +116,16 @@ def get_bands_data(outputs, fermi_energy=None):
 
 def get_bands_projections_data(
     outputs,
-    bands_data,
     group_tag,
     plot_tag,
     selected_atoms,
-    bands_width,
 ):
+    """Return the curated projections of the bands.
+
+    The result does not depend on the width of the fat bands, so it can be cached and
+    turned into plottable traces with `prepare_projected_bands_traces` whenever the
+    width changes.
+    """
     if "projwfc" not in outputs:
         return None
 
@@ -157,9 +162,11 @@ def get_bands_projections_data(
                 )
             )
 
-    bands_projection["projected_bands"] = _prepare_projections_to_plot(
-        bands_data, projections, bands_width
-    )
+    bands_projection["projected_bands"] = [
+        {**proj, "spin": spin}
+        for spin, spin_projections in enumerate(projections)
+        for proj in spin_projections
+    ]
     if plot_tag != "total":
         band_parameters: dict = outputs.band_parameters.get_dict()
         if not band_parameters.get("spin_orbit_calculation"):
@@ -382,47 +389,41 @@ def _curate_orbitals(orbital):
     return orbital_name_plotly, orbital_angular_momentum, kind_name, atom_position
 
 
-def _prepare_projections_to_plot(bands_data, projections, bands_width):
+def prepare_projected_bands_traces(
+    bands_data, projected_bands, bands_width, scale, min_halfwidth=0.0, y_window=None
+):
     """Prepare the projected bands to be plotted.
 
-    This function transforms the projected bands into a format that can be plotted
-    in a single trace. To use the fill option `toself`,
-    a band needs to be concatenated with its mirror image, first.
+    Each projection becomes a single trace of NaN-separated polygons that can be
+    plotted with the fill option `toself`. The thickness of a band is `bands_width`
+    times the projection, measured perpendicular to the band on screen, see
+    `fat_bands.fat_band_polygons`.
+
+    :param scale: pixels per unit of the k-point and the energy axis of the plot.
+    :param min_halfwidth: stretches thinner than this (half-width in pixels) are not
+        drawn, as they are not visible anyway. This removes most of the points for
+        typical projections and keeps the plot responsive.
+    :param y_window: if given, only the stretches reaching into this (lower, upper)
+        range of energies (in the units of `bands_data`, i.e. not shifted by the Fermi
+        energy) are drawn.
     """
-    projected_bands = []
-    for spin in [0, 1]:
-        # In case of non-spin-polarized calculations, the spin index is only 0
-        if spin not in bands_data["band_type_idx"]:
-            continue
-
-        x_bands = bands_data["x"]
+    traces = []
+    for proj in projected_bands:
         # New shape: (number of bands, number of kpoints)
-        y_bands = bands_data["y"][:, bands_data["band_type_idx"] == spin].T
-
-        for proj in projections[spin]:
-            # Create the upper and lower boundary of the fat bands based on the orbital projections
-            y_bands_proj_upper = y_bands + bands_width / 2 * proj["projections"].T
-            y_bands_proj_lower = y_bands - bands_width / 2 * proj["projections"].T
-            # As mentioned above, the bands need to be concatenated with their mirror image
-            # to create the filled areas properly
-            y_bands_mirror = np.hstack(
-                [y_bands_proj_upper, y_bands_proj_lower[:, ::-1]]
-            )
-            # Same logic for the energy axis
-            x_bands_mirror = np.concatenate([x_bands, x_bands[::-1]]).reshape(1, -1)
-            x_bands_comb, y_bands_proj_comb = prepare_combined_plotly_traces(
-                x_bands_mirror, y_bands_mirror
-            )
-
-            projected_bands.append(
-                {
-                    "x": x_bands_comb.tolist(),
-                    "y": y_bands_proj_comb.tolist(),
-                    "label": proj["label"],
-                    "color": proj["color"],
-                }
-            )
-    return projected_bands
+        y_bands = bands_data["y"][:, bands_data["band_type_idx"] == proj["spin"]].T
+        halfwidth = bands_width / 2 * np.asarray(proj["projections"]).T
+        x_poly, y_poly = fat_band_polygons(
+            bands_data["x"], y_bands, halfwidth, scale, min_halfwidth, y_window
+        )
+        traces.append(
+            {
+                "x": x_poly,
+                "y": y_poly,
+                "label": proj["label"],
+                "color": proj["color"],
+            }
+        )
+    return traces
 
 
 def _projections_curated_options(

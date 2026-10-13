@@ -1,3 +1,5 @@
+import re
+
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -6,6 +8,7 @@ from aiidalab_qe.common.bands_pdos.utils import (
     find_max_in_range,
     find_max_up_and_down,
     prepare_combined_plotly_traces,
+    prepare_projected_bands_traces,
 )
 
 
@@ -26,6 +29,12 @@ class BandsPdosPlotly:
         "horizontal_linecolor": "#111111",
         "vertical_range_bands": [-10, 10],
         "horizontal_range_pdos": [-10, 10],
+        "projected_bands_width": 0.5,
+        # Projected bands are only computed within the energy range shown, extended
+        # by this fraction of it on both sides, and recomputed when panning further
+        "projected_bands_window_margin": 0.5,
+        # Fat bands thinner than this (half-width in pixels) are not drawn
+        "projected_bands_min_halfwidth_px": 0.3,
     }
 
     def __init__(
@@ -41,6 +50,9 @@ class BandsPdosPlotly:
         self.pdos_data = pdos_data
         self.project_bands = bands_projections_data
         self.plot_settings = plot_settings or {}
+        # Pixel scales and energy window the projected bands were last computed with
+        self._projected_bands_scale_used = None
+        self._projected_bands_window_used = None
 
         self.fermi_energy = self._get_fermi_energy()
 
@@ -189,12 +201,14 @@ class BandsPdosPlotly:
 
         self.adding_bands_traces(fig)
         self.adding_pdos_traces(fig)
-        self.adding_projected_bands(fig)
 
         if self.plot_type == "combined":
             self._customize_combined_layout(fig)
         else:
             self._customize_single_layout(fig)
+
+        # After the layout, as the drawn stretches depend on the plot size and range
+        self.adding_projected_bands(fig)
 
         return go.FigureWidget(fig)
 
@@ -234,9 +248,10 @@ class BandsPdosPlotly:
                     },
                 )
 
-    def adding_projected_bands(self, fig):
+    def adding_projected_bands(self, fig, width=None):
         if self.project_bands:
-            self._add_projection_traces(fig)
+            width = self.SETTINGS["projected_bands_width"] if width is None else width
+            self._add_projection_traces(fig, width)
 
     def _create_fig(self):
         """Create a plotly figure.
@@ -367,12 +382,80 @@ class BandsPdosPlotly:
 
         self._add_traces_to_fig(fig, scatter_objects, 2)
 
-    def _prepare_bands_projection_traces_data(self, projected_bands):
+    def _bands_plot_area(self, fig, legend_labels=()):
+        """Estimate the size in pixels of the area of the figure that holds the plots.
+
+        The figure is only rendered in the browser, so the size is derived from the
+        layout and the defaults of plotly. A legend to the right of the plots widens the
+        right margin. Its width is estimated from the longest label: about 7 pixels per
+        character for the default font, plus 52 pixels for the symbol and padding.
+
+        :param legend_labels: labels of legend entries that are about to be added.
+        """
+        layout = fig.layout
+        width = layout.width or 700
+        height = layout.height or 450
+        margin = layout.margin
+        left = 80 if margin.l is None else margin.l
+        right = 80 if margin.r is None else margin.r
+        top = 100 if margin.t is None else margin.t
+        bottom = 80 if margin.b is None else margin.b
+
+        labels = [*legend_labels] + [
+            trace.name or "" for trace in fig.data if trace.showlegend is not False
+        ]
+        show_legend = layout.showlegend
+        if show_legend is None:
+            # The projections are added with `showlegend=True`
+            show_legend = (
+                len(labels) > 1
+                or bool(legend_labels)
+                or any(trace.showlegend for trace in fig.data)
+            )
+        legend_x = 1.02 if layout.legend.x is None else layout.legend.x
+        if show_legend and labels and legend_x >= 1:
+            text_length = max(len(re.sub(r"<[^>]*>", "", label)) for label in labels)
+            legend_width = 52 + 7 * text_length
+            right = max(
+                right, ((legend_x - 1) * (width - left) + legend_width) / legend_x
+            )
+
+        return width - left - right, height - top - bottom
+
+    def _projected_bands_scale(self, fig, legend_labels=()):
+        """Return the pixels per unit of the k-point and the energy axis of the bands."""
+        width, height = self._bands_plot_area(fig, legend_labels)
+        x_domain = fig.layout.xaxis.domain or (0, 1)
+        y_domain = fig.layout.yaxis.domain or (0, 1)
+        x_range = fig.layout.xaxis.range or (
+            np.min(self.bands_data["x"]),
+            np.max(self.bands_data["x"]),
+        )
+        y_range = self._bands_y_range(fig)
+        return (
+            width * (x_domain[1] - x_domain[0]) / abs(x_range[1] - x_range[0]),
+            height * (y_domain[1] - y_domain[0]) / abs(y_range[1] - y_range[0]),
+        )
+
+    def _bands_y_range(self, fig):
+        """Return the energy range (relative to the Fermi energy) shown in the plot."""
+        return fig.layout.yaxis.range or self.SETTINGS["vertical_range_bands"]
+
+    def _projected_bands_window(self, fig):
+        """Return the energy range (relative to the Fermi energy) in which the
+        projected bands are computed: the range shown, extended on both sides."""
+        lower, upper = sorted(self._bands_y_range(fig))
+        margin = self.SETTINGS["projected_bands_window_margin"] * (upper - lower)
+        return lower - margin, upper + margin
+
+    def _prepare_bands_projection_traces_data(self, fig, width):
         """
         Prepares data for adding or updating projected band traces.
 
         Args:
-            projected_bands (list[dict]): List of projected bands data.
+            fig: the figure the traces are drawn in, which sets their pixel scales
+                and the energy window in which they are computed.
+            width (float): the thickness (eV) of the bands for a projection of 1.
 
         Returns:
             list[dict]: List of dictionaries containing x, y (with Fermi offset), color, and label.
@@ -382,28 +465,48 @@ class BandsPdosPlotly:
             (False, False): self.fermi_energy.get("fermi_energy_down", None),
         }
 
+        # In the bands-only plot, the projections add their own legend entries
+        legend_labels = (
+            [proj["label"] for proj in self.project_bands]
+            if self.plot_type == "bands"
+            else []
+        )
+        self._projected_bands_scale_used = self._projected_bands_scale(
+            fig, legend_labels
+        )
+        self._projected_bands_window_used = self._projected_bands_window(fig)
+        lower, upper = self._projected_bands_window_used
+
         prepared_data = []
-        for proj_bands in projected_bands:
+        for projection in self.project_bands:
             fermi_energy = spin_mapping.get(
                 (
                     "fermi_energy" in self.fermi_energy,
-                    proj_bands["label"].endswith("(↑)"),
+                    projection["label"].endswith("(↑)"),
                 ),
                 self.fermi_energy.get("fermi_energy"),
+            )
+            (proj_bands,) = prepare_projected_bands_traces(
+                self.bands_data,
+                [projection],
+                width,
+                scale=self._projected_bands_scale_used,
+                min_halfwidth=self.SETTINGS["projected_bands_min_halfwidth_px"],
+                y_window=(lower + fermi_energy, upper + fermi_energy),
             )
             prepared_data.append(
                 {
                     "x": proj_bands["x"],
-                    "y": np.array(proj_bands["y"]) - fermi_energy,
+                    "y": proj_bands["y"] - fermi_energy,
                     "color": proj_bands["color"],
                     "label": proj_bands["label"],
                 }
             )
         return prepared_data
 
-    def _add_projection_traces(self, fig):
+    def _add_projection_traces(self, fig, width):
         """Function to add the projected bands traces to the bands plot."""
-        prepared_data = self._prepare_bands_projection_traces_data(self.project_bands)
+        prepared_data = self._prepare_bands_projection_traces_data(fig, width)
 
         scatter_objects = [
             go.Scattergl(
@@ -422,17 +525,45 @@ class BandsPdosPlotly:
 
         self._add_traces_to_fig(fig, scatter_objects, 1)
 
-    def update_projected_bands_thickness(self, fig):
+    def update_projected_bands_thickness(self, fig, width):
         """Update the projected bands thickness."""
-        prepared_data = self._prepare_bands_projection_traces_data(self.project_bands)
+        prepared_data = self._prepare_bands_projection_traces_data(fig, width)
 
-        # Create a mapping from labels to y-data for efficient updates
-        y_data_by_label = {data["label"]: data["y"] for data in prepared_data}
+        # Which stretches are drawn depends on the width, so both x and y change
+        data_by_label = {data["label"]: data for data in prepared_data}
 
         with fig.batch_update():
             for trace in fig.data:
-                if trace.xaxis == "x" and trace.legendgroup in y_data_by_label:
-                    trace.y = y_data_by_label[trace.legendgroup]
+                # The PDOS traces (`x2`) share the legend group, while the bands-only
+                # plot has no subplots, so its traces have no `xaxis` set
+                if trace.xaxis != "x2" and trace.legendgroup in data_by_label:
+                    data = data_by_label[trace.legendgroup]
+                    trace.x = data["x"]
+                    trace.y = data["y"]
+
+    def update_projected_bands_on_relayout(self, fig, width):
+        """Update the projected bands after the axis ranges changed, e.g. by zooming.
+
+        The outlines are in data coordinates, so they stay correct when both axes are
+        scaled by the same factor. They are only recomputed when the aspect ratio
+        changes noticeably, when zooming in far enough that skipped thin stretches
+        would become visible, or when the range shown leaves the energy window the
+        outlines were computed in.
+        """
+        if not self.project_bands or self._projected_bands_scale_used is None:
+            return
+        scale_x, scale_y = self._projected_bands_scale(fig)
+        used_x, used_y = self._projected_bands_scale_used
+        aspect_change = abs(np.log((scale_x / scale_y) / (used_x / used_y)))
+        lower, upper = sorted(self._bands_y_range(fig))
+        used_lower, used_upper = self._projected_bands_window_used
+        if (
+            aspect_change > np.log(1.15)
+            or scale_y > 2 * used_y
+            or lower < used_lower
+            or upper > used_upper
+        ):
+            self.update_projected_bands_thickness(fig, width)
 
     def _customize_combined_layout(self, fig):
         self._customize_layout(fig, self._bands_xaxis, self._bands_yaxis)
