@@ -123,7 +123,7 @@ def get_bands_projections_data(
     """Return the curated projections of the bands.
 
     The result does not depend on the width of the fat bands, so it can be cached and
-    turned into plottable traces with `prepare_projected_bands_traces` whenever the
+    turned into plottable traces with `prepare_projected_bands_trace` whenever the
     width changes.
     """
     if "projwfc" not in outputs:
@@ -389,12 +389,12 @@ def _curate_orbitals(orbital):
     return orbital_name_plotly, orbital_angular_momentum, kind_name, atom_position
 
 
-def prepare_projected_bands_traces(
-    bands_data, projected_bands, bands_width, scale, min_halfwidth=0.0, y_window=None
+def prepare_projected_bands_trace(
+    bands_data, projection, bands_width, scale, min_halfwidth=0.0, y_window=None
 ):
-    """Prepare the projected bands to be plotted.
+    """Prepare a projection of the bands to be plotted.
 
-    Each projection becomes a single trace of NaN-separated polygons that can be
+    The projection becomes a single trace of NaN-separated polygons that can be
     plotted with the fill option `toself`. The thickness of a band is `bands_width`
     times the projection, measured perpendicular to the band on screen, see
     `fat_bands.fat_band_polygons`.
@@ -407,23 +407,18 @@ def prepare_projected_bands_traces(
         range of energies (in the units of `bands_data`, i.e. not shifted by the Fermi
         energy) are drawn.
     """
-    traces = []
-    for proj in projected_bands:
-        # New shape: (number of bands, number of kpoints)
-        y_bands = bands_data["y"][:, bands_data["band_type_idx"] == proj["spin"]].T
-        halfwidth = bands_width / 2 * np.asarray(proj["projections"]).T
-        x_poly, y_poly = fat_band_polygons(
-            bands_data["x"], y_bands, halfwidth, scale, min_halfwidth, y_window
-        )
-        traces.append(
-            {
-                "x": x_poly,
-                "y": y_poly,
-                "label": proj["label"],
-                "color": proj["color"],
-            }
-        )
-    return traces
+    # New shape: (number of bands, number of kpoints)
+    y_bands = bands_data["y"][:, bands_data["band_type_idx"] == projection["spin"]].T
+    halfwidth = bands_width / 2 * np.asarray(projection["projections"]).T
+    x_poly, y_poly = fat_band_polygons(
+        bands_data["x"], y_bands, halfwidth, scale, min_halfwidth, y_window
+    )
+    return {
+        "x": x_poly,
+        "y": y_poly,
+        "label": projection["label"],
+        "color": projection["color"],
+    }
 
 
 def _projections_curated_options(

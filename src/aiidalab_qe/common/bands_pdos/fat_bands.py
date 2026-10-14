@@ -4,30 +4,30 @@ The thickness of a fat band has to be measured perpendicular to the band, otherw
 steep bands look thin regardless of their projection. As the two axes of the plot have
 different units, "perpendicular" is only meaningful on screen. The outlines are
 therefore constructed in pixels, using the scales of the plot, and converted back to
-data coordinates afterwards.
+data coordinates afterwards. Points are stored as complex numbers `x + iy`.
 
 The outline of a band is the envelope of discs centred on the band, whose radius is
-the local half-width. At smooth bends, the two sides are offset along the bisector of
-the adjacent normals (miter join). At sharp bends, e.g. band crossings, the outer side
-follows an arc while the inner side meets at a single point (round join).
+the local half-width. At a bend, the outer side goes around the arc of the disc with
+one point per `ARC_STEP_ANGLE` of the turn (a single point, the miter join, for gentle
+bends), while the inner side meets at a single point.
 
 The outlines are returned as NaN-separated polygons, to be plotted in a single trace
 with `fill="toself"`. WebGL fills every polygon on its own and cannot handle
 self-intersecting ones, which is why the outline is split into pieces that share their
-edges: strips of regular segments, fans for the round joins and folded segments, which
-occur where the band bends tighter than its thickness, on their own.
+edges (overlapping pieces would show darker seams with a transparent fill): strips of
+regular segments, fans around the outer side of sharp bends (as part of a strip, their
+inner point often ends up on the wrong side of a neighbouring piece) and folded
+segments, which occur where the band bends tighter than its thickness, on their own.
 """
 
 import numpy as np
 
-# Bends sharper than this get a round outer corner instead of a miter join
-ROUND_JOIN_ANGLE = np.radians(30)
-# Angular resolution of the arcs of round joins
+# Angular resolution of the outer side of bends, bends up to this angle get a miter join
 ARC_STEP_ANGLE = np.radians(30)
-# Longest miter, relative to the half-width
-MAX_MITER = 2.0
 # Largest change of the half-width along the band that is followed by the envelope
 MAX_SLOPE = 0.7
+
+_NAN = complex(np.nan, np.nan)
 
 
 def fat_band_polygons(x, y, halfwidth, scale, min_halfwidth=0.0, y_window=None):
@@ -45,197 +45,104 @@ def fat_band_polygons(x, y, halfwidth, scale, min_halfwidth=0.0, y_window=None):
     :return: the x and y coordinates of the polygons in data units.
     """
     scale_x, scale_y = scale
-    num_bands = y.shape[0]
-
-    # Work in pixels on the flattened bands: vertex `i` and `i + 1` are connected by
-    # segment `i`, the segments between consecutive bands are never used
-    px = np.tile(np.asarray(x, dtype=float) * scale_x, num_bands)
-    py = y.ravel() * scale_y
-    radius = halfwidth.ravel() * scale_y
-
     first, last = _visible_runs(x, y, halfwidth, min_halfwidth / scale_y, y_window)
     if first.size == 0:
         return np.array([]), np.array([])
 
-    dx, dy = np.diff(px), np.diff(py)
-    length = np.hypot(dx, dy)
-    length[length == 0] = 1.0
-    tx, ty = dx / length, dy / length
-    nx, ny = -ty, tx
-
-    # Each run covers the vertices `first..last + 1`
-    num_vertices = last - first + 2
-    run = np.repeat(np.arange(first.size), num_vertices)
-    pos = np.arange(num_vertices.sum()) - np.repeat(
-        np.cumsum(num_vertices) - num_vertices, num_vertices
+    # Work in pixels on the flattened bands: vertex `i` and `i + 1` are connected by
+    # segment `i`, the segments between consecutive bands are never used
+    num_bands = y.shape[0]
+    p = np.tile(np.asarray(x, dtype=float) * scale_x, num_bands) + 1j * (
+        y.ravel() * scale_y
     )
-    vertex = first[run] + pos
-    is_start = pos == 0
-    is_end = pos == num_vertices[run] - 1
-    interior = ~is_start & ~is_end
-
-    # Signed turning angle at the interior vertices
-    turn = np.zeros(vertex.size)
-    v = vertex[interior]
-    turn[interior] = np.arctan2(
-        tx[v - 1] * ty[v] - ty[v - 1] * tx[v],
-        tx[v - 1] * tx[v] + ty[v - 1] * ty[v],
-    )
-    is_round = interior & (np.abs(turn) > ROUND_JOIN_ANGLE)
-
-    # Round joins are drawn with several points along an arc, others with one
-    num_points = np.where(
-        is_round, 1 + np.ceil(np.abs(turn) / ARC_STEP_ANGLE).astype(int), 1
-    )
-    arc_step = np.arange(num_points.sum()) - np.repeat(
-        np.cumsum(num_points) - num_points, num_points
-    )
-    run, vertex, turn = (np.repeat(a, num_points) for a in (run, vertex, turn))
-    is_start, is_end, is_round = (
-        np.repeat(a, num_points) for a in (is_start, is_end, is_round)
-    )
-    num_points = np.repeat(num_points, num_points)
-    is_smooth = ~is_start & ~is_end & ~is_round
-
-    upper_x, upper_y = np.empty(vertex.size), np.empty(vertex.size)
-    lower_x, lower_y = np.empty(vertex.size), np.empty(vertex.size)
-
-    def offset(mask, normal_x, normal_y, slope, upper=1.0, lower=1.0):
-        """Offset the vertices to both sides, on the envelope of the discs.
-
-        Where the radius changes along the band, the envelope touches the disc
-        slightly behind its centre, by the rate of change `slope`. `upper` and
-        `lower` scale the offset to either side.
-        """
-        r = radius[vertex[mask]]
-        along = -slope * r
-        across = np.sqrt(1 - slope**2) * r
-        # The tangent is the normal rotated clockwise
-        base_x = px[vertex[mask]] + along * normal_y
-        base_y = py[vertex[mask]] - along * normal_x
-        upper_x[mask] = base_x + upper * across * normal_x
-        upper_y[mask] = base_y + upper * across * normal_y
-        lower_x[mask] = base_x - lower * across * normal_x
-        lower_y[mask] = base_y - lower * across * normal_y
-
-    def inner_limit(mask):
-        """Return the largest offset on the inner side of a bend, relative to the
-        half-width, for which the inner side does not fold over itself.
-
-        Beyond the local radius of curvature, the offsets of neighbouring vertices
-        cross each other and the overlapping pieces would be drawn twice.
-        """
-        v = vertex[mask]
-        half_turn = np.abs(turn[mask]) / 2
-        available = np.minimum(length[v - 1], length[v]) / 2
-        with np.errstate(divide="ignore"):
-            curvature_radius = available / np.tan(half_turn)
-        return np.minimum(1.0, curvature_radius / np.maximum(radius[v], 1e-12))
-
-    # Ends of a run: perpendicular to their only segment
-    seg = vertex[is_start]
-    offset(
-        is_start, nx[seg], ny[seg], _clip((radius[seg + 1] - radius[seg]) / length[seg])
-    )
-    seg = vertex[is_end] - 1
-    offset(
-        is_end, nx[seg], ny[seg], _clip((radius[seg + 1] - radius[seg]) / length[seg])
-    )
-
-    # Smooth bends: miter join along the bisector of the adjacent normals
-    v = vertex[is_smooth]
-    bisector_x, bisector_y = _normalize(nx[v - 1] + nx[v], ny[v - 1] + ny[v])
-    rate = (radius[v + 1] - radius[v - 1]) / (length[v - 1] + length[v])
-    miter = 1 / np.maximum(np.cos(turn[is_smooth] / 2), 1 / MAX_MITER)
-    # The inner side is on the left (upper) for a counterclockwise turn
-    inner = miter * inner_limit(is_smooth)
-    upper_is_inner = turn[is_smooth] > 0
-    offset(
-        is_smooth,
-        bisector_x,
-        bisector_y,
-        _clip(rate),
-        upper=np.where(upper_is_inner, inner, miter),
-        lower=np.where(upper_is_inner, miter, inner),
-    )
-
-    # Sharp bends: arc on the outer side, a single (limited) miter point on the inner
-    v = vertex[is_round]
-    r = radius[v]
-    angle = np.arctan2(ny[v - 1], nx[v - 1]) + turn[is_round] * arc_step[is_round] / (
-        num_points[is_round] - 1
-    )
-    outer_side = -np.sign(turn[is_round])
-    outer_x = px[v] + outer_side * r * np.cos(angle)
-    outer_y = py[v] + outer_side * r * np.sin(angle)
-    bisector_x, bisector_y = _normalize(nx[v - 1] + nx[v], ny[v - 1] + ny[v])
-    inner_distance = (
-        r * inner_limit(is_round) / np.maximum(np.cos(turn[is_round] / 2), 1e-3)
-    )
-    inner_x = px[v] - outer_side * inner_distance * bisector_x
-    inner_y = py[v] - outer_side * inner_distance * bisector_y
-    upper_is_outer = outer_side > 0
-    upper_x[is_round] = np.where(upper_is_outer, outer_x, inner_x)
-    upper_y[is_round] = np.where(upper_is_outer, outer_y, inner_y)
-    lower_x[is_round] = np.where(upper_is_outer, inner_x, outer_x)
-    lower_y[is_round] = np.where(upper_is_outer, inner_y, outer_y)
+    radius = halfwidth.ravel() * scale_y
+    upper, lower, run, vertex = _offset_sides(p, radius, first, last)
 
     # Pieces between consecutive points of the same run
     piece = np.flatnonzero(run[:-1] == run[1:])
     is_fan = vertex[piece] == vertex[piece + 1]
-    seg = vertex[piece]
-    upper_a = (upper_x[piece], upper_y[piece])
-    upper_b = (upper_x[piece + 1], upper_y[piece + 1])
-    lower_a = (lower_x[piece], lower_y[piece])
-    lower_b = (lower_x[piece + 1], lower_y[piece + 1])
-    # A side running backwards, or sides crossing each other (twisted)
-    is_folded = ~is_fan & (
-        ((upper_b[0] - upper_a[0]) * tx[seg] + (upper_b[1] - upper_a[1]) * ty[seg] < 0)
-        | (
-            (lower_b[0] - lower_a[0]) * tx[seg] + (lower_b[1] - lower_a[1]) * ty[seg]
-            < 0
-        )
-        | _crossing(upper_a, upper_b, lower_a, lower_b)
-        | _crossing(upper_a, lower_a, upper_b, lower_b)
-    )
-    kind = np.where(is_fan, 2, np.where(is_folded, 1, 0))
-    # Merge consecutive pieces of the same kind into one polygon, except folded ones
-    new_polygon = np.ones(piece.size, dtype=bool)
-    new_polygon[1:] = (
-        (run[piece[1:]] != run[piece[:-1]]) | (kind[1:] != kind[:-1]) | is_folded[1:]
-    )
-    starts = np.flatnonzero(new_polygon)
-    ends = np.r_[starts[1:], piece.size] - 1
-    regular = ~is_folded[starts]
-    starts, ends = starts[regular], ends[regular]
-    strip_x, strip_y = _strip_polygons(
-        upper_x, upper_y, lower_x, lower_y, piece[starts], piece[ends] + 1
+    is_folded = ~is_fan & _is_folded(
+        upper, lower, piece, _unit(np.diff(p)[vertex[piece]])
     )
 
-    # A folded piece crosses itself. Its corners all lie within the half-width of its
-    # segment, so ordering them by angle around their centre gives a simple polygon
-    # that still stays within the outline of the band.
-    folded = piece[is_folded]
-    corners_x = np.column_stack(
-        [upper_x[folded], upper_x[folded + 1], lower_x[folded + 1], lower_x[folded]]
-    )
-    corners_y = np.column_stack(
-        [upper_y[folded], upper_y[folded + 1], lower_y[folded + 1], lower_y[folded]]
-    )
-    order = np.argsort(
-        np.arctan2(
-            corners_y - corners_y.mean(axis=1, keepdims=True),
-            corners_x - corners_x.mean(axis=1, keepdims=True),
-        ),
-        axis=1,
-    )
-    separator = np.full((folded.size, 1), np.nan)
-    folded_x = np.hstack([np.take_along_axis(corners_x, order, axis=1), separator])
-    folded_y = np.hstack([np.take_along_axis(corners_y, order, axis=1), separator])
+    # Merge consecutive pieces of the same kind (regular or fan) into strips, folded
+    # ones are left out and leave a gap in `piece`, as do the boundaries between runs
+    regular, fan = piece[~is_folded], is_fan[~is_folded]
+    new_strip = np.r_[True, (np.diff(regular) != 1) | (fan[1:] != fan[:-1])]
+    starts = np.flatnonzero(new_strip)
+    ends = np.r_[starts[1:], regular.size] - 1
+    strips = _strip_polygons(upper, lower, regular[starts], regular[ends] + 1)
 
-    poly_x = np.concatenate([strip_x, folded_x.ravel()])
-    poly_y = np.concatenate([strip_y, folded_y.ravel()])
-    return poly_x / scale_x, poly_y / scale_y
+    poly = np.concatenate([strips, _folded_polygons(upper, lower, piece[is_folded])])
+    return poly.real / scale_x, poly.imag / scale_y
+
+
+def _offset_sides(p, radius, first, last):
+    """Return the points of the upper and lower side of the runs of segments
+    `first..last`, with the run and the vertex each point belongs to.
+
+    Sharp bends contribute several points along the arc of their outer side, all
+    other vertices one.
+    """
+    # Each run covers the vertices `first..last + 1`
+    num_vertices = last - first + 2
+    run, pos = _ragged_arange(num_vertices)
+    vertex = first[run] + pos
+    is_start = pos == 0
+    is_end = pos == num_vertices[run] - 1
+
+    # Segments before and after each vertex, the ends of a run only have one
+    seg_prev = np.where(is_start, vertex, vertex - 1)
+    seg_next = np.where(is_end, vertex - 1, vertex)
+    d = np.diff(p)
+    length = np.abs(d)
+    t_prev, t_next = _unit(d[seg_prev]), _unit(d[seg_next])
+    # Signed turning angle, zero at the ends
+    turn = np.arctan2(_cross(t_prev, t_next), _dot(t_prev, t_next))
+    # Normals point to the upper side, the bisector is the normal at the ends
+    bisector = _unit(1j * (t_prev + t_next))
+    r = radius[vertex]
+    # The outer side of a bend is the upper one for a clockwise turn
+    outer_side = np.where(turn > 0, -1.0, 1.0)
+
+    # Largest offset on the inner side of a bend, relative to the half-width, for
+    # which the inner side does not fold over itself. Beyond the local radius of
+    # curvature, the offsets of neighbouring vertices cross each other and the
+    # overlapping pieces would be drawn twice.
+    available = np.minimum(length[seg_prev], length[seg_next]) / 2
+    with np.errstate(divide="ignore"):
+        curvature_radius = available / np.tan(np.abs(turn) / 2)
+    inner_limit = np.minimum(1.0, curvature_radius / np.maximum(r, 1e-12))
+
+    # Where the radius changes along the band, the envelope of the discs touches each
+    # disc slightly behind its centre, by the rate of change `slope`. This is the same
+    # as touching a smaller disc whose centre is shifted back along the tangent.
+    span = length[seg_prev] + np.where(is_start | is_end, 0.0, length[seg_next])
+    slope = (radius[seg_next + 1] - radius[seg_prev]) / span
+    slope = np.clip(slope, -MAX_SLOPE, MAX_SLOPE)
+    centre = p[vertex] + 1j * slope * r * bisector
+    r = np.sqrt(1 - slope**2) * r
+
+    # Inner side: a single point on the bisector (miter), limited as above
+    inner = (
+        centre
+        - outer_side * r * inner_limit / np.maximum(np.cos(turn / 2), 1e-3) * bisector
+    )
+
+    # Outer side: the polygon around the arc between the normals of the two segments,
+    # one point per `ARC_STEP_ANGLE` of the turn. For a single point, this is the miter
+    # join, at the ends of a run the normal of the segment.
+    num_points = np.maximum(1, np.ceil(np.abs(turn) / ARC_STEP_ANGLE)).astype(int)
+    owner, step = _ragged_arange(num_points)
+    half_step = turn[owner] / (2 * num_points[owner])
+    direction = 1j * t_prev[owner] * np.exp(1j * (2 * step + 1) * half_step)
+    outer = centre[owner] + outer_side[owner] * r[owner] / np.cos(half_step) * direction
+    inner = inner[owner]
+
+    upper_is_outer = outer_side[owner] > 0
+    upper = np.where(upper_is_outer, outer, inner)
+    lower = np.where(upper_is_outer, inner, outer)
+    return upper, lower, run[owner], vertex[owner]
 
 
 def _visible_runs(x, y, halfwidth, min_halfwidth, y_window=None):
@@ -259,42 +166,78 @@ def _visible_runs(x, y, halfwidth, min_halfwidth, y_window=None):
     return band * num_kpoints + first, band * num_kpoints + stop - 1
 
 
-def _strip_polygons(upper_x, upper_y, lower_x, lower_y, starts, ends):
+def _is_folded(upper, lower, piece, tangent):
+    """Return whether the pieces between the points `piece` and `piece + 1` fold over,
+    i.e. a side runs backwards along `tangent`, or the sides cross each other."""
+    upper_a, upper_b = upper[piece], upper[piece + 1]
+    lower_a, lower_b = lower[piece], lower[piece + 1]
+
+    def backwards(a, b):
+        return _dot(b - a, tangent) < 0
+
+    return (
+        backwards(upper_a, upper_b)
+        | backwards(lower_a, lower_b)
+        | _crossing(upper_a, upper_b, lower_a, lower_b)
+        | _crossing(upper_a, lower_a, upper_b, lower_b)
+    )
+
+
+def _strip_polygons(upper, lower, starts, ends):
     """Return the polygons along the upper side of the points `starts..ends`, back
     along the lower side, each followed by a NaN separator."""
     num_points = ends - starts + 1
-    num_total = 2 * num_points + 1
-    polygon = np.repeat(np.arange(starts.size), num_total)
-    pos = np.arange(num_total.sum()) - np.repeat(
-        np.cumsum(num_total) - num_total, num_total
+    polygon, pos = _ragged_arange(2 * num_points + 1)
+    start, num_points = starts[polygon], num_points[polygon]
+    # Index into the upper points, followed by the lower ones and the separator
+    point = np.where(
+        pos < num_points, start + pos, upper.size + start + 2 * num_points - 1 - pos
     )
-    num_points = num_points[polygon]
-    upper = pos < num_points
-    separator = pos == 2 * num_points
-    point = starts[polygon] + np.where(upper, pos, 2 * num_points - 1 - pos)
-    point[separator] = starts[polygon][separator]
+    point[pos == 2 * num_points] = 2 * upper.size
+    return np.concatenate([upper, lower, [_NAN]])[point]
 
-    poly_x = np.where(upper, upper_x[point], lower_x[point])
-    poly_y = np.where(upper, upper_y[point], lower_y[point])
-    poly_x[separator] = np.nan
-    poly_y[separator] = np.nan
-    return poly_x, poly_y
+
+def _folded_polygons(upper, lower, folded):
+    """Return the polygons of the folded pieces, each followed by a NaN separator.
+
+    A folded piece crosses itself. Its corners all lie within the half-width of its
+    segment, so ordering them by angle around their centre gives a simple polygon
+    that still stays within the outline of the band.
+    """
+    corners = np.column_stack(
+        [upper[folded], upper[folded + 1], lower[folded + 1], lower[folded]]
+    )
+    order = np.argsort(np.angle(corners - corners.mean(axis=1, keepdims=True)), axis=1)
+    separator = np.full((folded.size, 1), _NAN)
+    return np.hstack([np.take_along_axis(corners, order, axis=1), separator]).ravel()
+
+
+def _ragged_arange(counts):
+    """Return, for groups of `counts` elements, the group of each element and its
+    position within the group."""
+    group = np.repeat(np.arange(counts.size), counts)
+    return group, np.arange(group.size) - (np.cumsum(counts) - counts)[group]
 
 
 def _crossing(a, b, c, d):
-    """Return whether the segments `a-b` and `c-d` cross, given as (x, y) arrays."""
+    """Return whether the segments `a-b` and `c-d` cross."""
 
     def side(o, p, q):
-        return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
+        return _cross(p - o, q - o)
 
     return (side(a, b, c) * side(a, b, d) < 0) & (side(c, d, a) * side(c, d, b) < 0)
 
 
-def _normalize(vx, vy):
-    norm = np.hypot(vx, vy)
+# Written out, as complex multiplication does not give exact zeros for parallel vectors
+def _cross(a, b):
+    return a.real * b.imag - a.imag * b.real
+
+
+def _dot(a, b):
+    return a.real * b.real + a.imag * b.imag
+
+
+def _unit(v):
+    norm = np.abs(v)
     norm[norm < 1e-12] = 1.0
-    return vx / norm, vy / norm
-
-
-def _clip(slope):
-    return np.clip(slope, -MAX_SLOPE, MAX_SLOPE)
+    return v / norm

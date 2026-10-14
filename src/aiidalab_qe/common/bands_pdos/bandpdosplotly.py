@@ -8,7 +8,7 @@ from aiidalab_qe.common.bands_pdos.utils import (
     find_max_in_range,
     find_max_up_and_down,
     prepare_combined_plotly_traces,
-    prepare_projected_bands_traces,
+    prepare_projected_bands_trace,
 )
 
 
@@ -486,9 +486,9 @@ class BandsPdosPlotly:
                 ),
                 self.fermi_energy.get("fermi_energy"),
             )
-            (proj_bands,) = prepare_projected_bands_traces(
+            proj_bands = prepare_projected_bands_trace(
                 self.bands_data,
-                [projection],
+                projection,
                 width,
                 scale=self._projected_bands_scale_used,
                 min_halfwidth=self.SETTINGS["projected_bands_min_halfwidth_px"],
